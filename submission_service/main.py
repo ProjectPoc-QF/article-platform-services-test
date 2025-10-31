@@ -1,54 +1,52 @@
 import uuid
-from fastapi import FastAPI, status
+import json
+import pika
+import redis # Import the redis library
+from fastapi import FastAPI, status, HTTPException # Import HTTPException
 from pydantic import BaseModel, Field, HttpUrl
 
-# 1. Initialize the FastAPI application
+# ... (app initialization is the same) ...
 app = FastAPI(
     title="Submission Service",
     description="Handles the submission of articles for analysis.",
 )
 
-# 2. Define Pydantic models to match the OpenAPI contract schemas
-# These enforce data validation for requests and responses.
+# --- NEW: Connect to Redis ---
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
+# ... (Pydantic models are the same) ...
 class ArticleSubmission(BaseModel):
-    url: HttpUrl # Pydantic validates this is a valid URL
-
+    url: HttpUrl
 class SubmissionAck(BaseModel):
     job_id: uuid.UUID = Field(..., description="The unique ID for the processing job.")
-
 class ProcessingResult(BaseModel):
     job_id: uuid.UUID
     status: str
     url: HttpUrl
-    analysis: dict | None = None # Analysis can be null if pending
+    analysis: dict | None = None
 
-
-# 3. Implement the POST endpoint for submitting an article
+# ... (The POST endpoint submit_article_for_analysis remains exactly the same) ...
 @app.post(
     "/articles",
     summary="Submit an article for analysis",
-    status_code=status.HTTP_202_ACCEPTED, # Set the success status code to 202
+    status_code=status.HTTP_202_ACCEPTED,
     response_model=SubmissionAck,
 )
 def submit_article_for_analysis(submission: ArticleSubmission):
-    """
-    Accepts an article URL, generates a unique job ID,
-    and simulates publishing a job to the message queue.
-    """
-    # Generate a unique ID for this job
+    # ... (no changes here) ...
     job_id = uuid.uuid4()
-
-    # TODO: In Step 3, we will replace this print statement
-    # with code that sends a message to RabbitMQ.
-    print(f"Received job {job_id} for URL: {submission.url}")
-    print("--> Publishing job to message queue... (SIMULATED)")
-
-    # Return the acknowledgement response to the client
+    message_body = {"job_id": str(job_id), "url": str(submission.url)}
+    connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
+    channel = connection.channel()
+    channel.queue_declare(queue='article_analysis_jobs', durable=True)
+    channel.basic_publish(
+        exchange='', routing_key='article_analysis_jobs', body=json.dumps(message_body),
+        properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE)
+    )
+    connection.close()
+    print(f"--> Published job {job_id} to RabbitMQ for URL: {submission.url}")
     return SubmissionAck(job_id=job_id)
 
-
-# 4. Implement a placeholder GET endpoint for retrieving results
 @app.get(
     "/articles/{jobId}",
     summary="Get the analysis result for an article",
@@ -56,18 +54,26 @@ def submit_article_for_analysis(submission: ArticleSubmission):
 )
 def get_analysis_result(jobId: uuid.UUID):
     """
-    A placeholder endpoint. In a later step, this will query
-    a database to get the actual job status and result.
+    Retrieves the job status and result from the Redis database.
     """
-    # TODO: In Step 4, we will replace this with a real database lookup.
-    print(f"--> Checking status for job {jobId}... (SIMULATED)")
+    # --- REPLACEMENT FOR THE TODO ---
+    print(f"--> Checking status for job {jobId} in Redis...")
+    
+    result_json = redis_client.get(str(jobId))
 
-    # For now, we return a hardcoded "pending" status.
+    if result_json is None:
+        # If the key doesn't exist, it means the worker hasn't even
+        # started processing it yet, or the ID is invalid.
+        # We return a 404 Not Found error.
+        raise HTTPException(status_code=404, detail="Job ID not found.")
+
+    # The result is stored as a JSON string, so we parse it.
+    result_data = json.loads(result_json)
+    
     return ProcessingResult(
         job_id=jobId,
-        status="pending",
-        # We don't have the URL here yet, so we use a placeholder.
-        # This shows a limitation we will fix later.
-        url="http://example.com",
-        analysis=None
+        status=result_data.get("status"),
+        url=result_data.get("url"),
+        analysis=result_data.get("analysis")
     )
+    # --- END OF REPLACEMENT ---
